@@ -9,6 +9,8 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.redis.core.RedisTemplate;
+import javax.persistence.EntityManager;
+import javax.persistence.PersistenceContext;
 
 @Service
 public class ModelService {
@@ -25,6 +27,9 @@ public class ModelService {
     private final SemanticStateRepository stateRepository;
     private final SaleRepository saleRepository;
     private final RedisTemplate<String, Object> redisTemplate;
+
+    @PersistenceContext
+    private EntityManager entityManager;
 
     private final Map<String, String> systemHealth = new ConcurrentHashMap<String, String>() {
         {
@@ -242,11 +247,17 @@ public class ModelService {
         } catch (Exception e) {
             systemHealth.put("LegacyDB", "DOWN");
         }
+        org.springframework.data.redis.connection.RedisConnection conn = null;
         try {
-            redisTemplate.getConnectionFactory().getConnection().ping();
+            conn = redisTemplate.getConnectionFactory().getConnection();
+            conn.ping();
             systemHealth.put("Redis", "ACTIVE");
         } catch (Exception e) {
             systemHealth.put("Redis", "DOWN");
+        } finally {
+            if (conn != null) {
+                try { conn.close(); } catch (Exception ignored) {}
+            }
         }
 
         Map<String, Object> localTool = new HashMap<>();
@@ -319,10 +330,71 @@ public class ModelService {
     }
 
     private String getMemoryResponse(String query) {
-        String key = query.toLowerCase().contains("stock") ? "stock_status" : "last_order";
-        return stateRepository.findById(key)
-                .map(SemanticState::getStateValue)
-                .orElse("Critical infrastructure alert: All systems brownout.");
+        String q = query.toLowerCase();
+
+        // 1. Transactional / Dynamic Overrides (Orders/Sales)
+        if (q.contains("order") || q.contains("sale")) {
+            List<Sale> recentSales = saleRepository.findTop10ByOrderByTimestampDesc();
+            if (!recentSales.isEmpty()) {
+                Sale lastSale = recentSales.get(0);
+                return String.format("Order #%d - %s ($%.2f) to %s - Pending", 
+                        lastSale.getId(), lastSale.getProductName(), lastSale.getAmount(), lastSale.getRegion());
+            } else {
+                return "No recent orders found in database mirror.";
+            }
+        }
+
+        // 2. Generic Semantic State Match - DB'ye Yük Bindirmeyen Optimizasyon
+        // Sadece query'deki anlamlı kelimeleri içeren kayıtları DB'den çek
+        String[] rawWords = q.split("[^a-z0-9]+");
+        List<String> keywords = new ArrayList<>();
+        for (String w : rawWords) {
+            if (w.length() > 3 && !w.equals("what") && !w.equals("this") && !w.equals("that")) {
+                keywords.add(w);
+            }
+        }
+
+        if (!keywords.isEmpty()) {
+            StringBuilder sql = new StringBuilder("SELECT s FROM SemanticState s WHERE ");
+            for (int i = 0; i < keywords.size(); i++) {
+                if (i > 0) sql.append(" OR ");
+                sql.append("LOWER(s.stateKey) LIKE :word").append(i);
+            }
+            
+            javax.persistence.TypedQuery<SemanticState> typedQuery = entityManager.createQuery(sql.toString(), SemanticState.class);
+            for (int i = 0; i < keywords.size(); i++) {
+                typedQuery.setParameter("word" + i, "%" + keywords.get(i) + "%");
+            }
+            
+            List<SemanticState> candidates = typedQuery.getResultList();
+            
+            // Çekilen adaylar içinde en uygun olanı bul
+            for (SemanticState state : candidates) {
+                String key = state.getStateKey().toLowerCase();
+                String spacedKey = key.replace("_", " ");
+                
+                // Tam eşleşme (örn: "enterprise knowledge")
+                if (q.contains(key) || q.contains(spacedKey)) {
+                    return state.getStateValue();
+                }
+                
+                // Esnek kelime bazlı eşleşme
+                String[] keyWords = spacedKey.split(" ");
+                boolean allWordsMatch = true;
+                for (String word : keyWords) {
+                    if (word.length() > 3 && !q.contains(word)) { 
+                        allWordsMatch = false;
+                        break;
+                    }
+                }
+                
+                if (allWordsMatch && keyWords.length > 0) {
+                     return state.getStateValue();
+                }
+            }
+        }
+
+        return "Critical infrastructure alert: Gateway down. Shield Mode active for limited read-only queries.";
     }
 
     public List<ResiliencyLog> getLogs() {
@@ -337,11 +409,17 @@ public class ModelService {
         } catch (Exception e) {
             systemHealth.put("LegacyDB", "DOWN");
         }
+        org.springframework.data.redis.connection.RedisConnection conn = null;
         try {
-            redisTemplate.getConnectionFactory().getConnection().ping();
+            conn = redisTemplate.getConnectionFactory().getConnection();
+            conn.ping();
             systemHealth.put("Redis", "ACTIVE");
         } catch (Exception e) {
             systemHealth.put("Redis", "DOWN");
+        } finally {
+            if (conn != null) {
+                try { conn.close(); } catch (Exception ignored) {}
+            }
         }
         return new HashMap<>(systemHealth);
     }
@@ -363,5 +441,52 @@ public class ModelService {
         summary.put("storage", storage);
         
         return summary;
+    }
+
+    @org.springframework.scheduling.annotation.Scheduled(fixedRate = 4000)
+    public void monitorGatewayConnectivity() {
+        String host = "gateway.truefoundry.ai";
+        int port = 443;
+
+        if (gatewayUrl != null && !gatewayUrl.isEmpty()) {
+            try {
+                java.net.URI uri = new java.net.URI(gatewayUrl);
+                String uriHost = uri.getHost();
+                if (uriHost != null) {
+                    host = uriHost;
+                }
+                if (uri.getPort() != -1) {
+                    port = uri.getPort();
+                } else if (gatewayUrl.startsWith("https")) {
+                    port = 443;
+                } else {
+                    port = 80;
+                }
+            } catch (Exception e) {
+                // Keep default gateway.truefoundry.ai:443
+            }
+        }
+
+        boolean isNowOnline = false;
+        try (java.net.Socket socket = new java.net.Socket()) {
+            socket.connect(new java.net.InetSocketAddress(host, port), 2000);
+            isNowOnline = true;
+        } catch (Exception e) {
+            isNowOnline = false;
+        }
+
+        boolean wasOnline = "ACTIVE".equals(systemHealth.get("Gemma 4"));
+
+        if (isNowOnline && !wasOnline) {
+            systemHealth.put("Gemma 4", "ACTIVE");
+            systemHealth.put("GLM 4.5", "ACTIVE");
+            systemHealth.put("Llama 3.1 405B", "ACTIVE");
+            logAction("INFO", "ORCHESTRATOR", "SUCCESS", 0, "AI Gateway connectivity restored. Normal operations resumed.");
+        } else if (!isNowOnline && wasOnline) {
+            systemHealth.put("Gemma 4", "DOWN");
+            systemHealth.put("GLM 4.5", "DOWN");
+            systemHealth.put("Llama 3.1 405B", "DOWN");
+            logAction("CRITICAL", "ORCHESTRATOR", "SHIELD_ACTIVE", 0, "AI Gateway unreachable. Proactively transitioned to Emergency Shield Mode.");
+        }
     }
 }
