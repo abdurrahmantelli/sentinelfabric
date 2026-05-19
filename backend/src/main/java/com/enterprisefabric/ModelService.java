@@ -42,6 +42,59 @@ public class ModelService {
         }
     };
 
+    private volatile boolean credentialsInvalid = false;
+    private String lastKnownApiKey = null;
+
+    private String getDynamicApiKey() {
+        try {
+            java.io.File file = new java.io.File("src/main/resources/application.properties");
+            if (file.exists()) {
+                java.util.Properties props = new java.util.Properties();
+                try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+                    props.load(fis);
+                    String key = props.getProperty("truefoundry.api.key");
+                    if (key != null) {
+                        return key.trim();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Fallback to static apiKey field
+        }
+        return this.apiKey;
+    }
+
+    private boolean validateApiKeyAgainstGateway(String apiKey) {
+        if (apiKey == null || apiKey.trim().isEmpty()) {
+            return false;
+        }
+        try {
+            String modelsUrl = gatewayUrl;
+            if (modelsUrl == null || modelsUrl.isEmpty()) {
+                return false;
+            }
+            if (modelsUrl.endsWith("/chat/completions")) {
+                modelsUrl = modelsUrl.substring(0, modelsUrl.length() - "/chat/completions".length()) + "/models";
+            } else if (modelsUrl.endsWith("/chat/completions/")) {
+                modelsUrl = modelsUrl.substring(0, modelsUrl.length() - "/chat/completions/".length()) + "/models";
+            }
+            
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + apiKey);
+            HttpEntity<Void> entity = new HttpEntity<>(headers);
+            
+            ResponseEntity<Map> response = restTemplate.exchange(modelsUrl, HttpMethod.GET, entity, Map.class);
+            return response.getStatusCode().is2xxSuccessful();
+        } catch (org.springframework.web.client.HttpClientErrorException e) {
+            if (e.getStatusCode() == HttpStatus.UNAUTHORIZED || e.getStatusCode() == HttpStatus.FORBIDDEN) {
+                return false;
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     public ModelService(McpService mcpService,
             ResiliencyLogRepository logRepository,
             SemanticStateRepository stateRepository,
@@ -91,97 +144,157 @@ public class ModelService {
         }});
 
         boolean success = false;
-        for (Map.Entry<String, String> entry : modelChain.entrySet()) {
-            String displayName = entry.getKey();
-            String modelId = entry.getValue();
 
-            try {
-                logAction("INFO", displayName, "ATTEMPT", 0, "Agent thinking...");
-                
-                ResponseEntity<Map> modelResponseEntity = callTrueFoundry(messages, modelId);
-                Map<String, Object> modelResponse = modelResponseEntity.getBody();
-                
-                // Detect TrueFoundry Cache Header
-                String tfCache = modelResponseEntity.getHeaders().getFirst("x-tfy-cache-status");
-                String tfScore = modelResponseEntity.getHeaders().getFirst("x-tfy-cache-similarity-score");
-
-                if ("hit".equalsIgnoreCase(tfCache)) {
-                    responseSource = "Semantic Cache (Gateway)";
-                    if (tfScore != null) responseSource += " [Sim: " + tfScore + "]";
-                }
-
-                List choices = (List) modelResponse.get("choices");
-                Map choice = (Map) choices.get(0);
-                Map message = (Map) choice.get("message");
-
-                if (message.get("tool_calls") != null) {
-                    logs.add("ACTION: " + displayName + " requested tool access.");
-                    List toolCalls = (List) message.get("tool_calls");
-                    messages.add(message);
-
-                    for (Object tc : toolCalls) {
-                        Map toolCall = (Map) tc;
-                        String toolName = (String) ((Map) toolCall.get("function")).get("name");
-                        String toolArgs = (String) ((Map) toolCall.get("function")).get("arguments");
-
-                        String toolResult = executeTool(toolName, toolArgs, logs);
-
-                        Map<String, String> toolMsg = new HashMap<>();
-                        toolMsg.put("role", "tool");
-                        toolMsg.put("tool_call_id", (String) toolCall.get("id"));
-                        toolMsg.put("name", toolName);
-                        toolMsg.put("content", toolResult);
-                        messages.add(toolMsg);
-                    }
-
-                    logs.add("ACTION: Processing tool results...");
-                    modelResponseEntity = callTrueFoundry(messages, modelId);
-                    modelResponse = modelResponseEntity.getBody();
-                    choices = (List) modelResponse.get("choices");
-                    choice = (Map) choices.get(0);
-                    message = (Map) choice.get("message");
-                    
-                    // Re-check cache for the final response after tools
-                    tfCache = modelResponseEntity.getHeaders().getFirst("x-tfy-cache-status");
-                    if ("hit".equalsIgnoreCase(tfCache)) {
-                        responseSource = "Semantic Cache (TrueFoundry)";
-                    } else {
-                        responseSource = "LLM + MCP Tool";
-                    }
-                }
-
-                result = (String) message.get("content");
-                systemHealth.put(displayName, "ACTIVE");
-                activeModel = displayName;
-                
-                // Save to L1 Redis Cache for future resiliency
-                try {
-                    redisTemplate.opsForValue().set(cacheKey, result);
-                } catch (Exception re) {}
-
-                long latency = (int) (System.currentTimeMillis() - startTime);
-                logAction("INFO", displayName, "SUCCESS", (int) latency, "[SOURCE: " + responseSource + "]");
-                success = true;
+        // Check if all gateway models are offline proactively
+        boolean gatewayOffline = true;
+        for (String modelName : modelChain.keySet()) {
+            if ("ACTIVE".equals(systemHealth.get(modelName))) {
+                gatewayOffline = false;
                 break;
-            } catch (Exception e) {
-                // Tier 2 Fallback: Lokal Redis (Infrastructure Protection)
-                try {
-                    String cached = (String) redisTemplate.opsForValue().get(cacheKey);
-                    if (cached != null) {
-                        System.out.println(">>> GATEWAY_FAIL: Fallback to Lokal Redis for [" + query + "]");
-                        result = cached;
-                        activeModel = "L1 Redis Fallback";
-                        responseSource = "Lokal Redis (Resiliency)";
-                        logs.add("RESILIENCY: Gateway failure. Serving from local Redis fallback.");
-                        success = true;
-                        break;
-                    }
-                } catch (Exception re) {}
-
-                systemHealth.put(displayName, "DOWN");
-                logAction("WARNING", displayName, "FAILOVER", 0, "Model error. Falling back.");
-                logs.add("FAILURE: " + displayName + " failed. Trying next...");
             }
+        }
+
+        if (gatewayOffline) {
+            logs.add("SYSTEM: AI Gateway is detected as offline or all models are down. Bypassing model chain.");
+            try {
+                String cached = (String) redisTemplate.opsForValue().get(cacheKey);
+                if (cached != null) {
+                    long latency = System.currentTimeMillis() - startTime;
+                    logAction("INFO", "L1 Redis Fallback", "SUCCESS", (int) latency, "[SOURCE: Lokal Redis (Resiliency)]");
+
+                    response.put("text", cached);
+                    response.put("model", "L1 Redis Fallback");
+                    response.put("health", new HashMap<>(systemHealth));
+                    logs.add("RESILIENCY: Serving from local Redis cache.");
+                    response.put("logs", logs);
+                    response.put("latency", latency);
+                    response.put("source", "Lokal Redis (Resiliency)");
+                    return response;
+                }
+            } catch (Exception re) {
+                logs.add("ERROR: Redis check failed: " + re.getMessage());
+            }
+
+            // Fallback to Shield Mode directly if Redis cache is a miss
+            logAction("CRITICAL", "ORCHESTRATOR", "SHIELD_ACTIVE", 0, "Emergency fallback to DB mirror (Gateway offline & cache miss).");
+            logs.add("CRITICAL: Shield Mode active.");
+            result = "[🛡️ SHIELD MODE] " + getMemoryResponse(query);
+            activeModel = "State Mirror (DB)";
+            responseSource = "Shield Mode (Database Mirror)";
+            success = true;
+        }
+
+        if (!success) {
+            for (Map.Entry<String, String> entry : modelChain.entrySet()) {
+                String displayName = entry.getKey();
+                String modelId = entry.getValue();
+
+                // Skip known offline/failing models to fail-fast
+                if ("DOWN".equals(systemHealth.get(displayName))) {
+                    logs.add("SYSTEM: Skipping model " + displayName + " (marked as DOWN).");
+                    continue;
+                }
+
+                try {
+                    logAction("INFO", displayName, "ATTEMPT", 0, "Agent thinking...");
+                    
+                    ResponseEntity<Map> modelResponseEntity = callTrueFoundry(messages, modelId);
+                    Map<String, Object> modelResponse = modelResponseEntity.getBody();
+                    
+                    // Detect TrueFoundry Cache Header
+                    String tfCache = modelResponseEntity.getHeaders().getFirst("x-tfy-cache-status");
+                    String tfScore = modelResponseEntity.getHeaders().getFirst("x-tfy-cache-similarity-score");
+
+                    if ("hit".equalsIgnoreCase(tfCache)) {
+                        responseSource = "Semantic Cache (Gateway)";
+                        if (tfScore != null) responseSource += " [Sim: " + tfScore + "]";
+                    }
+
+                    List choices = (List) modelResponse.get("choices");
+                    Map choice = (Map) choices.get(0);
+                    Map message = (Map) choice.get("message");
+
+                    if (message.get("tool_calls") != null) {
+                        logs.add("ACTION: " + displayName + " requested tool access.");
+                        List toolCalls = (List) message.get("tool_calls");
+                        messages.add(message);
+
+                        for (Object tc : toolCalls) {
+                            Map toolCall = (Map) tc;
+                            String toolName = (String) ((Map) toolCall.get("function")).get("name");
+                            String toolArgs = (String) ((Map) toolCall.get("function")).get("arguments");
+
+                            String toolResult = executeTool(toolName, toolArgs, logs);
+
+                            Map<String, String> toolMsg = new HashMap<>();
+                            toolMsg.put("role", "tool");
+                            toolMsg.put("tool_call_id", (String) toolCall.get("id"));
+                            toolMsg.put("name", toolName);
+                            toolMsg.put("content", toolResult);
+                            messages.add(toolMsg);
+                        }
+
+                        logs.add("ACTION: Processing tool results...");
+                        modelResponseEntity = callTrueFoundry(messages, modelId);
+                        modelResponse = modelResponseEntity.getBody();
+                        choices = (List) modelResponse.get("choices");
+                        choice = (Map) choices.get(0);
+                        message = (Map) choice.get("message");
+                        
+                        // Re-check cache for the final response after tools
+                        tfCache = modelResponseEntity.getHeaders().getFirst("x-tfy-cache-status");
+                        if ("hit".equalsIgnoreCase(tfCache)) {
+                            responseSource = "Semantic Cache (TrueFoundry)";
+                        } else {
+                            responseSource = "LLM + MCP Tool";
+                        }
+                    }
+
+                    result = (String) message.get("content");
+                    systemHealth.put(displayName, "ACTIVE");
+                    activeModel = displayName;
+                    
+                    // Save to L1 Redis Cache for future resiliency
+                    try {
+                        redisTemplate.opsForValue().set(cacheKey, result);
+                    } catch (Exception re) {}
+
+                    long latency = (int) (System.currentTimeMillis() - startTime);
+                    logAction("INFO", displayName, "SUCCESS", (int) latency, "[SOURCE: " + responseSource + "]");
+                    success = true;
+                    break;
+                } catch (Exception e) {
+                    systemHealth.put(displayName, "DOWN");
+                    logAction("WARNING", displayName, "FAILOVER", 0, "Model error: " + e.getMessage() + ". Falling back.");
+                    logs.add("FAILURE: " + displayName + " failed. Trying next...");
+                    
+                    if (e.getMessage() != null && (e.getMessage().contains("credentials missing") || 
+                        e.getMessage().contains("Unauthorized") || e.getMessage().contains("Forbidden") || 
+                        e.getMessage().contains("401") || e.getMessage().contains("403"))) {
+                        credentialsInvalid = true;
+                    }
+                    if (e instanceof org.springframework.web.client.HttpClientErrorException) {
+                        org.springframework.web.client.HttpClientErrorException he = (org.springframework.web.client.HttpClientErrorException) e;
+                        if (he.getStatusCode() == HttpStatus.UNAUTHORIZED || he.getStatusCode() == HttpStatus.FORBIDDEN) {
+                            credentialsInvalid = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!success) {
+            // Tier 2 Fallback: Check local Redis before going to Shield Mode
+            try {
+                String cached = (String) redisTemplate.opsForValue().get(cacheKey);
+                if (cached != null) {
+                    result = cached;
+                    activeModel = "L1 Redis Fallback";
+                    responseSource = "Lokal Redis (Resiliency)";
+                    logs.add("RESILIENCY: All models failed. Serving from local Redis fallback.");
+                    success = true;
+                }
+            } catch (Exception re) {}
         }
 
         if (!success) {
@@ -208,13 +321,14 @@ public class ModelService {
     }
 
     private ResponseEntity<Map> callTrueFoundry(List<Map<String, String>> messages, String modelName) {
-        if (gatewayUrl == null || gatewayUrl.isEmpty() || apiKey == null || apiKey.isEmpty()) {
+        String activeApiKey = getDynamicApiKey();
+        if (gatewayUrl == null || gatewayUrl.isEmpty() || activeApiKey == null || activeApiKey.isEmpty()) {
             throw new RuntimeException("API credentials missing");
         }
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.set("Authorization", "Bearer " + apiKey);
+        headers.set("Authorization", "Bearer " + activeApiKey);
         
         // OFFICIAL TRUEFOUNDRY SEMANTIC CACHE CONFIG
         String cacheConfig = "{\"type\": \"semantic\", \"similarity_threshold\": 0.70, \"ttl\": 3600, \"namespace\": \"sentinel-fabric-cache\"}";
@@ -467,12 +581,29 @@ public class ModelService {
             }
         }
 
+        String currentApiKey = getDynamicApiKey();
+        if (lastKnownApiKey == null) {
+            lastKnownApiKey = currentApiKey;
+            if (currentApiKey == null || currentApiKey.trim().isEmpty() || !validateApiKeyAgainstGateway(currentApiKey)) {
+                credentialsInvalid = true;
+            }
+        } else if (!lastKnownApiKey.equals(currentApiKey)) {
+            // API key changed! Reset credential error state and validate the new key
+            credentialsInvalid = false;
+            lastKnownApiKey = currentApiKey;
+            if (currentApiKey == null || currentApiKey.trim().isEmpty() || !validateApiKeyAgainstGateway(currentApiKey)) {
+                credentialsInvalid = true;
+            }
+        }
+
         boolean isNowOnline = false;
-        try (java.net.Socket socket = new java.net.Socket()) {
-            socket.connect(new java.net.InetSocketAddress(host, port), 2000);
-            isNowOnline = true;
-        } catch (Exception e) {
-            isNowOnline = false;
+        if (currentApiKey != null && !currentApiKey.trim().isEmpty() && !credentialsInvalid) {
+            try (java.net.Socket socket = new java.net.Socket()) {
+                socket.connect(new java.net.InetSocketAddress(host, port), 2000);
+                isNowOnline = true;
+            } catch (Exception e) {
+                isNowOnline = false;
+            }
         }
 
         boolean wasOnline = "ACTIVE".equals(systemHealth.get("Gemma 4"));
@@ -486,7 +617,7 @@ public class ModelService {
             systemHealth.put("Gemma 4", "DOWN");
             systemHealth.put("GLM 4.5", "DOWN");
             systemHealth.put("Llama 3.1 405B", "DOWN");
-            logAction("CRITICAL", "ORCHESTRATOR", "SHIELD_ACTIVE", 0, "AI Gateway unreachable. Proactively transitioned to Emergency Shield Mode.");
+            logAction("CRITICAL", "ORCHESTRATOR", "SHIELD_ACTIVE", 0, "AI Gateway unreachable or credentials invalid. Proactively transitioned to Emergency Shield Mode.");
         }
     }
 }
